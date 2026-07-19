@@ -15,6 +15,7 @@ target = noise - clean), so ``get_noise_prediction`` does no time flip / negatio
 
 import math
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -124,35 +125,123 @@ def patch_qwen_vl_patch_embed(model):
     return patched
 
 
-def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
-    """Load the MMDiT weights from a local safetensors file/dir or the HF hub.
+def _load_mmdit_state_dict(
+    name_or_path: str, filename: Optional[str] = None
+) -> dict:
+    """Load the MMDiT weights from a local path or Hugging Face hub repo.
 
-    ``name_or_path`` may be: a ``.safetensors`` file, a directory containing one
-    (``filename`` or the lone ``.safetensors`` in it), or a hub repo id (the
-    file ``filename`` is downloaded, defaulting to ``model.safetensors``).
+    ``name_or_path`` supports three cases. Local paths are detected *before* any
+    ``huggingface_hub`` call (no HF cache / fake-repo workarounds needed):
+
+    1. **Local single ``.safetensors`` file**
+       e.g. ``"/workspace/.../transformer/diffusion_pytorch_model.safetensors"``
+
+    2. **Local directory** (Diffusers-style tree or simple weights folder)
+       e.g. ``"/workspace/Krea-2-Raw-Lustify"``
+       Searches preferred names, then falls back to the largest ``.safetensors``.
+       ``filename`` (from ``model.model_kwargs.checkpoint_filename``) overrides
+       discovery when provided.
+
+    3. **Hugging Face repo ID** (original behaviour)
+       e.g. ``"krea/Krea-2-Raw"`` — downloads via ``hf_hub_download``.
     """
-    if name_or_path.endswith(".safetensors") and os.path.isfile(name_or_path):
-        return load_file(name_or_path)
+    # Detect local paths before calling any huggingface_hub functions.
+    path = Path(name_or_path).expanduser()
+    if path.exists():
+        path = path.resolve()
 
-    if os.path.isdir(name_or_path):
-        if filename is not None:
-            return load_file(os.path.join(name_or_path, filename))
-        candidates = [f for f in os.listdir(name_or_path) if f.endswith(".safetensors")]
-        if len(candidates) == 1:
-            return load_file(os.path.join(name_or_path, candidates[0]))
+        # -------------------------------------------------------
+        # Case 1 & 2: Local file or local directory
+        # -------------------------------------------------------
+
+        # Explicit override from model.model_kwargs.checkpoint_filename.
+        # If name_or_path is already a file, that file wins; otherwise look for
+        # ``filename`` under the directory (and under transformer/).
+        if filename:
+            if path.is_file():
+                return load_file(str(path), device="cpu")
+            if path.is_dir():
+                for candidate in (
+                    path / filename,
+                    path / "transformer" / filename,
+                ):
+                    if candidate.is_file():
+                        return load_file(str(candidate), device="cpu")
+                raise FileNotFoundError(
+                    f"checkpoint_filename={filename!r} not found under {path} "
+                    f"(also checked {path / 'transformer'}). "
+                    "Unset it to use automatic discovery."
+                )
+
+        # Direct .safetensors file
+        if path.is_file() and path.suffix == ".safetensors":
+            return load_file(str(path), device="cpu")
+
+        # Directory – search for weights
+        if path.is_dir():
+            # Prefer Diffusers transformer path / Krea root names. Relative
+            # paths are matched with endswith so os.walk order does not matter.
+            search_order = [
+                "transformer/diffusion_pytorch_model.safetensors",
+                "transformer/model.safetensors",
+                "diffusion_pytorch_model.safetensors",
+                "model.safetensors",
+                "raw.safetensors",
+                "turbo.safetensors",
+            ]
+
+            candidates: List[Path] = []
+            for root, _, files in os.walk(path):
+                for f in files:
+                    if f.endswith(".safetensors"):
+                        candidates.append(Path(root) / f)
+
+            # Prefer files matching search_order. When several files share the
+            # same basename (e.g. vae/ and transformer/ both have
+            # diffusion_pytorch_model.safetensors), pick the largest so the
+            # multi-GB MMDiT wins over the smaller VAE.
+            path_str = str(path)
+            for preferred in search_order:
+                matches = []
+                for c in candidates:
+                    rel = str(c).replace("\\", "/")
+                    if (
+                        c.name == preferred
+                        or rel.endswith("/" + preferred)
+                        or rel.endswith(preferred)
+                    ):
+                        matches.append(c)
+                if matches:
+                    chosen = max(matches, key=lambda p: p.stat().st_size)
+                    return load_file(str(chosen), device="cpu")
+
+            if candidates:
+                # Fall back to largest safetensors (transformer >> vae / te).
+                largest = max(candidates, key=lambda p: p.stat().st_size)
+                return load_file(str(largest), device="cpu")
+
+            raise FileNotFoundError(
+                f"No .safetensors weights found in local directory: {path}. "
+                "Point name_or_path at a .safetensors file, or set "
+                "model.model_kwargs.checkpoint_filename."
+            )
+
         raise FileNotFoundError(
-            f"Could not pick an MMDiT checkpoint in {name_or_path}: found "
-            f"{candidates}. Set model.model_kwargs.checkpoint_filename."
+            f"Local path {path} exists but is neither a .safetensors file nor "
+            "a directory containing weights."
         )
 
-    # Treat as a hub repo id. When no filename is given, derive it from the repo
-    # name's trailing segment (e.g. "krea/Krea-2-Raw" -> "raw.safetensors",
+    # -------------------------------------------------------
+    # Case 3: Hugging Face repo ID (original behaviour)
+    # -------------------------------------------------------
+    # When no filename is given, derive it from the repo name's trailing segment
+    # (e.g. "krea/Krea-2-Raw" -> "raw.safetensors",
     # "krea/Krea-2-Turbo" -> "turbo.safetensors").
     fname = filename or (
         name_or_path.split("/")[-1].split("-")[-1].lower() + ".safetensors"
     )
     try:
-        path = huggingface_hub.hf_hub_download(
+        hub_path = huggingface_hub.hf_hub_download(
             repo_id=name_or_path, filename=fname, token=HF_TOKEN
         )
     except EntryNotFoundError as e:
@@ -160,7 +249,17 @@ def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
             f"Could not find {fname!r} in hub repo {name_or_path!r}. Set "
             "model.model_kwargs.checkpoint_filename to the weight file name."
         ) from e
-    return load_file(path)
+    except Exception as e:
+        # HFValidationError / ValueError for bad repo ids (e.g. a missing local
+        # path that fell through). Surface a clear FileNotFoundError instead.
+        raise FileNotFoundError(
+            f"Could not load MMDiT weights from {name_or_path!r} "
+            f"(filename={fname!r}). If this is a local path, confirm it exists. "
+            f"If this is a Hugging Face repo id, set "
+            "model.model_kwargs.checkpoint_filename if needed. "
+            f"Original error: {e}"
+        ) from e
+    return load_file(hub_path, device="cpu")
 
 
 class Krea2Model(BaseModel):
