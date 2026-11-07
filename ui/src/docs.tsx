@@ -352,7 +352,9 @@ const docs: { [key: string]: ConfigDoc } = {
         Put a file next to the image. <code>photo.slider.json</code> with <code>positive_prompt</code> and{' '}
         <code>negative_prompt</code> owns both sides. A blank side keeps the job prompt. Without that file,{' '}
         <code>photo.pos.txt</code> and <code>photo.neg.txt</code> each override one side. You can edit these in the
-        dataset image viewer.
+        dataset image viewer. A folder-level <code>slider_prompts.json</code> is also read at training time. It is an
+        object with an <code>images</code> list, and each entry matches a filename and supplies the full{' '}
+        <code>positive</code> and <code>negative</code> prompts. A sidecar file wins over that folder file.
         <br />
         <br />
         <code>[caption]</code> in either prompt is replaced with that image&apos;s caption, so the job prompts can still

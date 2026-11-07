@@ -4,11 +4,16 @@ The job-level slider prompts still apply to every image. An image can override
 either side. This is the path used for Krea 2 concept sliders when the wording
 needs to change with the angle of the subject.
 
-Next to ``photo.jpg``:
+Next to ``photo.jpg``, in this order:
 
 - ``photo.slider.json`` owns both sides. Blank or missing fields fall back to
   the job prompt. ``.pos.txt`` / ``.neg.txt`` are ignored while this file exists.
 - otherwise ``photo.pos.txt`` and ``photo.neg.txt`` override one side each.
+  A side with no text file keeps looking.
+- otherwise ``slider_prompts.json`` in the same folder. It is one object with
+  an ``images`` list. An entry matches the image by its ``image`` filename.
+  ``positive`` / ``positive_prompt`` and ``negative`` / ``negative_prompt``
+  are the full prompts for that image. A sidecar still wins over this file.
 
 A prompt may contain ``[caption]`` (or ``{caption}``). That token is replaced
 with the image caption. ``[trigger]`` is replaced when the dataset has a
@@ -49,6 +54,49 @@ def _pick_field(data: dict, primary: str, alias: str) -> Optional[str]:
     return None
 
 
+# Parsed folder maps, keyed by absolute directory. Training reads each image
+# once before the text encoder is unloaded, so this stays for the process.
+_folder_prompt_cache: dict[str, dict[str, tuple[Optional[str], Optional[str]]]] = {}
+
+
+def _load_folder_prompt_map(directory: str) -> dict[str, tuple[Optional[str], Optional[str]]]:
+    directory = os.path.abspath(directory)
+    cached = _folder_prompt_cache.get(directory)
+    if cached is not None:
+        return cached
+
+    path = os.path.join(directory, "slider_prompts.json")
+    mapping: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid concept slider prompt file {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Concept slider prompt file {path} must be a JSON object")
+        images = data.get("images", [])
+        if not isinstance(images, list):
+            raise ValueError(
+                f"Concept slider prompt file {path} field 'images' must be a list"
+            )
+        for entry in images:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("image") or entry.get("filename") or entry.get("file")
+            if not name:
+                continue
+            key = os.path.basename(str(name)).strip().lower()
+            if key == "":
+                continue
+            mapping[key] = (
+                _pick_field(entry, "positive_prompt", "positive"),
+                _pick_field(entry, "negative_prompt", "negative"),
+            )
+    _folder_prompt_cache[directory] = mapping
+    return mapping
+
+
 def read_slider_prompt_overrides(image_path: str) -> tuple[Optional[str], Optional[str]]:
     """Return ``(positive, negative)``. ``None`` means that side has no override."""
     json_path, pos_path, neg_path = sidecar_paths(image_path)
@@ -64,7 +112,20 @@ def read_slider_prompt_overrides(image_path: str) -> tuple[Optional[str], Option
             _pick_field(data, "positive_prompt", "positive"),
             _pick_field(data, "negative_prompt", "negative"),
         )
-    return _read_text_override(pos_path), _read_text_override(neg_path)
+
+    positive = _read_text_override(pos_path)
+    negative = _read_text_override(neg_path)
+    if positive is None or negative is None:
+        folder_map = _load_folder_prompt_map(os.path.dirname(image_path) or ".")
+        folder_positive, folder_negative = folder_map.get(
+            os.path.basename(image_path).lower(),
+            (None, None),
+        )
+        if positive is None:
+            positive = folder_positive
+        if negative is None:
+            negative = folder_negative
+    return positive, negative
 
 
 def apply_prompt_placeholders(

@@ -6,6 +6,8 @@ import fs from 'fs';
  *
  * photo.slider.json owns both sides while it exists. Otherwise photo.pos.txt and
  * photo.neg.txt each override one side. A blank side means "use the job prompt".
+ * Training also reads a folder-level slider_prompts.json. This viewer only edits
+ * the per-image sidecars, and those sidecars win over the folder file.
  */
 
 export function imageStem(imgPath: string): string {

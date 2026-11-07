@@ -81,6 +81,86 @@ class SliderPromptTests(unittest.TestCase):
             self.assertIsNone(positive)
             self.assertEqual(negative, "right profile, frown")
 
+    def test_folder_slider_prompts_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = os.path.join(folder, "001.png")
+            open(image, "w").close()
+            with open(os.path.join(folder, "001.txt"), "w", encoding="utf-8") as handle:
+                handle.write("caption that must not become the prompt")
+            with open(os.path.join(folder, "slider_prompts.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "count": 1,
+                        "images": [
+                            {
+                                "image": "001.png",
+                                "positive": "full positive for 001",
+                                "negative": "full negative for 001",
+                            }
+                        ],
+                    },
+                    handle,
+                )
+            self.assertEqual(
+                slider_prompts.read_slider_prompt_overrides(image),
+                ("full positive for 001", "full negative for 001"),
+            )
+            other = os.path.join(folder, "002.png")
+            open(other, "w").close()
+            self.assertEqual(
+                slider_prompts.read_slider_prompt_overrides(other),
+                (None, None),
+            )
+
+    def test_text_sidecar_overrides_one_side_of_folder_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = os.path.join(folder, "Front.PNG")
+            open(image, "w").close()
+            with open(os.path.join(folder, "slider_prompts.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "images": [
+                            {
+                                "image": "front.png",
+                                "positive_prompt": "folder positive",
+                                "negative_prompt": "folder negative",
+                            }
+                        ]
+                    },
+                    handle,
+                )
+            with open(os.path.splitext(image)[0] + ".pos.txt", "w", encoding="utf-8") as handle:
+                handle.write("txt positive")
+            self.assertEqual(
+                slider_prompts.read_slider_prompt_overrides(image),
+                ("txt positive", "folder negative"),
+            )
+
+    def test_sidecar_json_beats_folder_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = os.path.join(folder, "003.png")
+            open(image, "w").close()
+            with open(os.path.join(folder, "slider_prompts.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"images": [{"image": "003.png", "positive": "folder", "negative": "folder"}]},
+                    handle,
+                )
+            with open(os.path.splitext(image)[0] + ".slider.json", "w", encoding="utf-8") as handle:
+                json.dump({"positive": "sidecar", "negative": ""}, handle)
+            self.assertEqual(
+                slider_prompts.read_slider_prompt_overrides(image),
+                ("sidecar", None),
+            )
+
+    def test_invalid_folder_slider_prompts_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image = os.path.join(folder, "004.png")
+            open(image, "w").close()
+            with open(os.path.join(folder, "slider_prompts.json"), "w", encoding="utf-8") as handle:
+                handle.write("{")
+            with self.assertRaises(ValueError):
+                slider_prompts.read_slider_prompt_overrides(image)
+
     def test_json_aliases_and_invalid_json(self):
         with tempfile.TemporaryDirectory() as folder:
             image = os.path.join(folder, "a.jpg")

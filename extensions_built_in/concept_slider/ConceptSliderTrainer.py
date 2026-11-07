@@ -147,6 +147,14 @@ class ConceptSliderTrainer(DiffusionTrainer):
             f"Per-image concept slider prompts: {custom} of {len(pairs)} images "
             f"differ from the job prompts ({len(unique_prompts)} unique prompt strings cached)."
         )
+        long_prompts = [prompt for prompt in unique_prompts if len(prompt) > 2000]
+        if long_prompts:
+            limit = getattr(self.sd, "max_text_length", None)
+            print_acc(
+                f"  {len(long_prompts)} of those prompts are over 2000 characters. "
+                f"Krea 2 truncates each prompt at max_text_length"
+                + (f" ({limit} tokens)." if limit else " (default 512 tokens).")
+            )
         for name, positive, negative in examples:
             print_acc(f"  {name}")
             print_acc(f"    positive: {_short_prompt(positive)}")
