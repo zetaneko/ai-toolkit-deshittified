@@ -1,10 +1,18 @@
+import os
 from collections import OrderedDict
 from typing import Optional
 
 import torch
 
+from extensions_built_in.concept_slider.slider_prompts import (
+    read_dataset_caption,
+    read_slider_prompt_overrides,
+    resolve_slider_prompts,
+)
 from extensions_built_in.sd_trainer.DiffusionTrainer import DiffusionTrainer
+from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
+from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.train_tools import get_torch_dtype
 
@@ -17,6 +25,22 @@ class ConceptSliderTrainerConfig:
         self.negative_prompt: str = kwargs.get("negative_prompt", "")
         self.target_class: str = kwargs.get("target_class", "")
         self.anchor_class: Optional[str] = kwargs.get("anchor_class", None)
+        # When true, each dataset image may supply its own positive and negative
+        # prompt. Images without one keep the job prompts above. See slider_prompts.py.
+        self.per_image_prompts: bool = _as_bool(kwargs.get("per_image_prompts", False))
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _short_prompt(prompt: str, limit: int = 160) -> str:
+    text = " ".join((prompt or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def norm_like_tensor(tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -48,6 +72,104 @@ class ConceptSliderTrainer(DiffusionTrainer):
         self.target_class_embeds: Optional[PromptEmbeds] = None
         self.anchor_class = self.slider.anchor_class
         self.anchor_class_embeds: Optional[PromptEmbeds] = None
+        # CPU copies keyed by the exact prompt string. PromptEmbeds.to mutates,
+        # so the batch path clones out of this cache before moving to the device.
+        self._prompt_embed_cache: dict[str, PromptEmbeds] = {}
+        self._image_prompt_pairs: Optional[dict[str, tuple[str, str]]] = None
+        self._use_per_image_prompt_batches = False
+
+    def _cache_prompt_embeds(self, prompt: str) -> PromptEmbeds:
+        cached = self._prompt_embed_cache.get(prompt)
+        if cached is not None:
+            return cached
+        embeds = self.sd.encode_prompt([prompt]).detach()
+        stored = embeds.clone().to("cpu")
+        self._prompt_embed_cache[prompt] = stored
+        return stored
+
+    def _encode_slider_prompt(self, prompt: str) -> PromptEmbeds:
+        """Encode once, keep a CPU copy, and return a device copy for the fast path."""
+        cached = self._cache_prompt_embeds(prompt)
+        return cached.clone().to(self.device_torch, dtype=self.sd.torch_dtype)
+
+    def _iter_dataset_file_items(self):
+        if self.data_loader is None:
+            return
+        for dataset in get_dataloader_datasets(self.data_loader):
+            file_list = getattr(dataset, "file_list", None)
+            if not file_list:
+                continue
+            caption_dict = getattr(dataset, "caption_dict", None)
+            for file_item in file_list:
+                yield file_item, caption_dict
+
+    def _prepare_per_image_prompts(self):
+        pairs: dict[str, tuple[str, str]] = {}
+        examples: list[tuple[str, str, str]] = []
+        seen_paths = set()
+        for file_item, caption_dict in self._iter_dataset_file_items():
+            path = file_item.path
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            caption = read_dataset_caption(path, file_item.dataset_config, caption_dict)
+            positive_override, negative_override = read_slider_prompt_overrides(path)
+            positive, negative = resolve_slider_prompts(
+                global_positive=self.positive_prompt,
+                global_negative=self.negative_prompt,
+                raw_caption=caption,
+                trigger=getattr(file_item, "trigger_word", None),
+                positive_override=positive_override,
+                negative_override=negative_override,
+            )
+            pairs[path] = (positive, negative)
+            if positive != self.positive_prompt or negative != self.negative_prompt:
+                if len(examples) < 3:
+                    examples.append((os.path.basename(path), positive, negative))
+
+        self._image_prompt_pairs = pairs
+        custom = sum(
+            1
+            for positive, negative in pairs.values()
+            if positive != self.positive_prompt or negative != self.negative_prompt
+        )
+        self._use_per_image_prompt_batches = custom > 0
+        if custom == 0:
+            print_acc(
+                "Per-image concept slider prompts are on, but every image uses the job prompts."
+            )
+            return
+
+        unique_prompts = {prompt for pair in pairs.values() for prompt in pair}
+        for prompt in unique_prompts:
+            self._cache_prompt_embeds(prompt)
+        print_acc(
+            f"Per-image concept slider prompts: {custom} of {len(pairs)} images "
+            f"differ from the job prompts ({len(unique_prompts)} unique prompt strings cached)."
+        )
+        for name, positive, negative in examples:
+            print_acc(f"  {name}")
+            print_acc(f"    positive: {_short_prompt(positive)}")
+            print_acc(f"    negative: {_short_prompt(negative)}")
+
+    def _prompt_pair_for(self, file_item) -> tuple[str, str]:
+        if self._image_prompt_pairs is not None:
+            pair = self._image_prompt_pairs.get(file_item.path)
+            if pair is not None:
+                return pair
+        return self.positive_prompt, self.negative_prompt
+
+    def _stack_cached_prompts(self, prompts: list[str], dtype) -> PromptEmbeds:
+        pieces = []
+        for prompt in prompts:
+            cached = self._prompt_embed_cache.get(prompt)
+            if cached is None:
+                raise RuntimeError(
+                    "Concept slider prompt was not encoded before the text encoder was unloaded: "
+                    + repr(prompt)
+                )
+            pieces.append(cached.clone())
+        return concat_prompt_embeds(pieces).to(self.device_torch, dtype=dtype)
 
     def hook_before_train_loop(self):
         # do this before calling parent as it unloads the text encoder if requested
@@ -55,40 +177,18 @@ class ConceptSliderTrainer(DiffusionTrainer):
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to("cpu")
 
-        # cache unconditional embeds (blank prompt)
+        # cache the job-level slider prompts. Per-image overrides are encoded
+        # here too, while the text encoder is still loaded.
         with torch.no_grad():
-            self.positive_prompt_embeds = (
-                self.sd.encode_prompt(
-                    [self.positive_prompt],
-                )
-                .to(self.device_torch, dtype=self.sd.torch_dtype)
-                .detach()
-            )
-
-            self.target_class_embeds = (
-                self.sd.encode_prompt(
-                    [self.target_class],
-                )
-                .to(self.device_torch, dtype=self.sd.torch_dtype)
-                .detach()
-            )
-
-            self.negative_prompt_embeds = (
-                self.sd.encode_prompt(
-                    [self.negative_prompt],
-                )
-                .to(self.device_torch, dtype=self.sd.torch_dtype)
-                .detach()
-            )
+            self.positive_prompt_embeds = self._encode_slider_prompt(self.positive_prompt)
+            self.target_class_embeds = self._encode_slider_prompt(self.target_class)
+            self.negative_prompt_embeds = self._encode_slider_prompt(self.negative_prompt)
 
             if self.anchor_class is not None:
-                self.anchor_class_embeds = (
-                    self.sd.encode_prompt(
-                        [self.anchor_class],
-                    )
-                    .to(self.device_torch, dtype=self.sd.torch_dtype)
-                    .detach()
-                )
+                self.anchor_class_embeds = self._encode_slider_prompt(self.anchor_class)
+
+            if self.slider.per_image_prompts:
+                self._prepare_per_image_prompts()
 
         # call parent
         super().hook_before_train_loop()
@@ -121,14 +221,29 @@ class ConceptSliderTrainer(DiffusionTrainer):
 
             batch_size = noisy_latents.shape[0]
 
-            positive_embeds = concat_prompt_embeds(
-                [self.positive_prompt_embeds] * batch_size
-            ).to(self.device_torch, dtype=dtype)
+            if self._use_per_image_prompt_batches:
+                if len(batch.file_items) != batch_size:
+                    raise ValueError(
+                        "Per-image concept slider prompts need one prompt pair per latent "
+                        f"({len(batch.file_items)} file items, batch size {batch_size})."
+                    )
+                positive_embeds = self._stack_cached_prompts(
+                    [self._prompt_pair_for(file_item)[0] for file_item in batch.file_items],
+                    dtype,
+                )
+                negative_embeds = self._stack_cached_prompts(
+                    [self._prompt_pair_for(file_item)[1] for file_item in batch.file_items],
+                    dtype,
+                )
+            else:
+                positive_embeds = concat_prompt_embeds(
+                    [self.positive_prompt_embeds] * batch_size
+                ).to(self.device_torch, dtype=dtype)
+                negative_embeds = concat_prompt_embeds(
+                    [self.negative_prompt_embeds] * batch_size
+                ).to(self.device_torch, dtype=dtype)
             target_class_embeds = concat_prompt_embeds(
                 [self.target_class_embeds] * batch_size
-            ).to(self.device_torch, dtype=dtype)
-            negative_embeds = concat_prompt_embeds(
-                [self.negative_prompt_embeds] * batch_size
             ).to(self.device_torch, dtype=dtype)
 
             if self.anchor_class_embeds is not None:

@@ -44,6 +44,11 @@ export default function DatasetImageViewer({
   const [caption, setCaption] = useState<string>('');
   const [savedCaption, setSavedCaption] = useState<string>('');
   const [isCaptionLoaded, setIsCaptionLoaded] = useState<boolean>(false);
+  const [sliderPositive, setSliderPositive] = useState('');
+  const [sliderNegative, setSliderNegative] = useState('');
+  const [savedSliderPositive, setSavedSliderPositive] = useState('');
+  const [savedSliderNegative, setSavedSliderNegative] = useState('');
+  const [isSliderLoaded, setIsSliderLoaded] = useState(false);
   const [showBoxes, setShowBoxes] = useState<boolean>(false);
   const [selectedBoxIndex, setSelectedBoxIndex] = useState<number | null>(null);
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
@@ -51,6 +56,13 @@ export default function DatasetImageViewer({
   const savedCaptionRef = useRef<string>('');
   const currentImgPathRef = useRef<string | null>(null);
   const captionAbortRef = useRef<AbortController | null>(null);
+  const sliderPositiveRef = useRef('');
+  const sliderNegativeRef = useRef('');
+  const savedSliderPositiveRef = useRef('');
+  const savedSliderNegativeRef = useRef('');
+  const sliderLoadedPathRef = useRef<string | null>(null);
+  const sliderPathRef = useRef<string | null>(null);
+  const sliderAbortRef = useRef<AbortController | null>(null);
 
   const isIdeogram = useMemo(() => isIdeogramCaption(caption), [caption]);
 
@@ -87,6 +99,18 @@ export default function DatasetImageViewer({
   useEffect(() => {
     savedCaptionRef.current = savedCaption;
   }, [savedCaption]);
+  useEffect(() => {
+    sliderPositiveRef.current = sliderPositive;
+  }, [sliderPositive]);
+  useEffect(() => {
+    sliderNegativeRef.current = sliderNegative;
+  }, [sliderNegative]);
+  useEffect(() => {
+    savedSliderPositiveRef.current = savedSliderPositive;
+  }, [savedSliderPositive]);
+  useEffect(() => {
+    savedSliderNegativeRef.current = savedSliderNegative;
+  }, [savedSliderNegative]);
 
   const filename = useMemo(() => {
     if (!imgPath) return '';
@@ -133,6 +157,55 @@ export default function DatasetImageViewer({
     if (!imgPath) return;
     saveCaptionForPath(imgPath, caption, savedCaption);
   }, [imgPath, caption, savedCaption, saveCaptionForPath]);
+
+  const saveSliderForPath = useCallback(
+    (
+      path: string,
+      positive: string,
+      negative: string,
+      prevPositive: string,
+      prevNegative: string,
+      loadedPath: string | null,
+    ) => {
+      if (loadedPath !== path) return;
+      const nextPositive = positive.trim();
+      const nextNegative = negative.trim();
+      if (nextPositive === prevPositive.trim() && nextNegative === prevNegative.trim()) return;
+      apiClient
+        .post('/api/img/slider-prompts', {
+          imgPath: path,
+          positive_prompt: nextPositive,
+          negative_prompt: nextNegative,
+        })
+        .then(() => {
+          if (currentImgPathRef.current === path) {
+            setSavedSliderPositive(nextPositive);
+            setSavedSliderNegative(nextNegative);
+          }
+        })
+        .catch(error => {
+          console.error('Error saving slider prompts:', error);
+        });
+    },
+    [],
+  );
+
+  const saveSliderForPathRef = useRef(saveSliderForPath);
+  useEffect(() => {
+    saveSliderForPathRef.current = saveSliderForPath;
+  }, [saveSliderForPath]);
+
+  const saveSliderPrompts = useCallback(() => {
+    if (!imgPath) return;
+    saveSliderForPath(
+      imgPath,
+      sliderPositive,
+      sliderNegative,
+      savedSliderPositive,
+      savedSliderNegative,
+      sliderLoadedPathRef.current,
+    );
+  }, [imgPath, sliderPositive, sliderNegative, savedSliderPositive, savedSliderNegative, saveSliderForPath]);
 
   // Fetch caption whenever the image changes; save any pending edits on the previous image first
   useEffect(() => {
@@ -184,20 +257,91 @@ export default function DatasetImageViewer({
     };
   }, [imgPath, captionExt]);
 
+  // Fetch per-image concept slider prompts. Same save-on-navigate behavior as captions.
+  // Own path ref: the caption effect updates currentImgPathRef before this runs.
+  useEffect(() => {
+    const previousPath = sliderPathRef.current;
+    if (previousPath && previousPath !== imgPath) {
+      saveSliderForPathRef.current(
+        previousPath,
+        sliderPositiveRef.current,
+        sliderNegativeRef.current,
+        savedSliderPositiveRef.current,
+        savedSliderNegativeRef.current,
+        sliderLoadedPathRef.current,
+      );
+    }
+    sliderPathRef.current = imgPath;
+
+    sliderAbortRef.current?.abort();
+    if (!imgPath) {
+      setSliderPositive('');
+      setSliderNegative('');
+      setSavedSliderPositive('');
+      setSavedSliderNegative('');
+      setIsSliderLoaded(false);
+      sliderLoadedPathRef.current = null;
+      return;
+    }
+
+    const controller = new AbortController();
+    sliderAbortRef.current = controller;
+    setIsSliderLoaded(false);
+    sliderLoadedPathRef.current = null;
+    setSliderPositive('');
+    setSliderNegative('');
+    setSavedSliderPositive('');
+    setSavedSliderNegative('');
+
+    apiClient
+      .post('/api/img/slider-prompts/get', { imgPath }, { signal: controller.signal })
+      .then(res => res.data)
+      .then(data => {
+        if (controller.signal.aborted) return;
+        const positive = typeof data?.positive_prompt === 'string' ? data.positive_prompt : '';
+        const negative = typeof data?.negative_prompt === 'string' ? data.negative_prompt : '';
+        setSliderPositive(positive);
+        setSliderNegative(negative);
+        setSavedSliderPositive(positive);
+        setSavedSliderNegative(negative);
+        sliderLoadedPathRef.current = imgPath;
+        setIsSliderLoaded(true);
+      })
+      .catch(error => {
+        if (controller.signal.aborted) return;
+        console.error('Error fetching slider prompts:', error);
+        sliderLoadedPathRef.current = imgPath;
+        setIsSliderLoaded(true);
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [imgPath]);
+
   // Save any pending caption when the viewer fully unmounts
   useEffect(() => {
     return () => {
       const path = currentImgPathRef.current;
       if (path) {
         saveCaptionForPath(path, captionRef.current, savedCaptionRef.current);
+        saveSliderForPathRef.current(
+          path,
+          sliderPositiveRef.current,
+          sliderNegativeRef.current,
+          savedSliderPositiveRef.current,
+          savedSliderNegativeRef.current,
+          sliderLoadedPathRef.current,
+        );
       }
     };
   }, [saveCaptionForPath]);
 
   const onCancel = useCallback(() => {
     saveCaption();
+    saveSliderPrompts();
     setIsOpen(false);
-  }, [saveCaption]);
+  }, [saveCaption, saveSliderPrompts]);
 
   const setImageAtIndex = useCallback(
     (idx: number) => {
@@ -571,6 +715,38 @@ export default function DatasetImageViewer({
                   />
                 </div>
               )}
+              <div className="text-xs text-gray-400 pt-1">
+                Slider prompts
+                <span className="text-gray-500"> — blank uses the job prompt</span>
+              </div>
+              <textarea
+                className={classNames(
+                  'w-full h-16 bg-gray-900 text-gray-100 text-sm p-2 resize-none rounded border-2 outline-none focus:ring-0 focus:outline-none',
+                  {
+                    'border-blue-500': sliderPositive.trim() !== savedSliderPositive.trim(),
+                    'border-gray-700': sliderPositive.trim() === savedSliderPositive.trim(),
+                  },
+                )}
+                placeholder={isSliderLoaded ? 'Positive prompt for this image' : 'Loading slider prompts...'}
+                value={sliderPositive}
+                onChange={e => setSliderPositive(e.target.value)}
+                onBlur={saveSliderPrompts}
+                disabled={!isSliderLoaded}
+              />
+              <textarea
+                className={classNames(
+                  'w-full h-16 bg-gray-900 text-gray-100 text-sm p-2 resize-none rounded border-2 outline-none focus:ring-0 focus:outline-none',
+                  {
+                    'border-blue-500': sliderNegative.trim() !== savedSliderNegative.trim(),
+                    'border-gray-700': sliderNegative.trim() === savedSliderNegative.trim(),
+                  },
+                )}
+                placeholder={isSliderLoaded ? 'Negative prompt for this image' : 'Loading slider prompts...'}
+                value={sliderNegative}
+                onChange={e => setSliderNegative(e.target.value)}
+                onBlur={saveSliderPrompts}
+                disabled={!isSliderLoaded}
+              />
             </div>
           </DialogPanel>
         </div>

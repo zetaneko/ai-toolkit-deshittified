@@ -340,6 +340,27 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'config.process[0].slider.per_image_prompts': {
+    title: 'Per-image prompts',
+    description: (
+      <>
+        Use a different positive and negative prompt for each dataset image. Images without an override keep the job
+        positive and negative prompts. This is for Krea 2 concept sliders when the wording should change with the angle
+        of the subject.
+        <br />
+        <br />
+        Put a file next to the image. <code>photo.slider.json</code> with <code>positive_prompt</code> and{' '}
+        <code>negative_prompt</code> owns both sides. A blank side keeps the job prompt. Without that file,{' '}
+        <code>photo.pos.txt</code> and <code>photo.neg.txt</code> each override one side. You can edit these in the
+        dataset image viewer.
+        <br />
+        <br />
+        <code>[caption]</code> in either prompt is replaced with that image&apos;s caption, so the job prompts can still
+        mention the angle written on the image. For example, positive <code>[caption], smiling</code> and negative{' '}
+        <code>[caption], frowning</code>.
+      </>
+    ),
+  },
   'model.model_kwargs.kv_cache': {
     title: 'KV Cache',
     description: (

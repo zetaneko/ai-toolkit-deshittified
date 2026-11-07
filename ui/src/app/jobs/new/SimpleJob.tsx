@@ -548,6 +548,13 @@ export default function SimpleJob({
                 onChange={value => setJobConfig(value, 'config.process[0].slider.negative_prompt')}
                 placeholder="eg. person who is sad"
               />
+              <Checkbox
+                label="Per-image prompts"
+                className="pt-2"
+                checked={jobConfig.config.process[0].slider?.per_image_prompts ?? false}
+                onChange={value => setJobConfig(value, 'config.process[0].slider.per_image_prompts')}
+                docKey="config.process[0].slider.per_image_prompts"
+              />
               <TextInput
                 label="Anchor Class"
                 className=""

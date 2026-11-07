@@ -227,6 +227,7 @@ export interface SliderConfig {
   negative_prompt?: string;
   target_class?: string;
   anchor_class?: string | null;
+  per_image_prompts?: boolean;
 }
 
 export interface ProcessConfig {

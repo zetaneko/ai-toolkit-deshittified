@@ -29,6 +29,7 @@ export const defaultSliderConfig: SliderConfig = {
   negative_prompt: 'person who is sad',
   target_class: 'person',
   anchor_class: '',
+  per_image_prompts: true,
 };
 
 export const defaultCompileOptions = {
